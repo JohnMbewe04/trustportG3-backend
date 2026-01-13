@@ -195,21 +195,22 @@ class GeminiAnalyzer:
                     temperature=0.2
                 )
             )
-
-            texr = response.text.strip()
-
-            if text.startswith("'''json"):
+            
+            # ✅ FIX: Handle standard markdown backticks (```) not single quotes (''')
+            text = response.text.strip()
+            
+            if text.startswith("```json"):
                 text = text[7:]
-            if text.startswith("'''"):
+            if text.startswith("```"):
                 text = text[3:]
-            if text.endswith("'''"):
+            if text.endswith("```"):
                 text = text[:-3]
             
             return json.loads(text.strip())
             
         except Exception as e:
             print(f"Gemini JSON Error: {e}")
-            print(f"Raw Response was: {response.text if 'response' in locals() else 'None'}")
+            # print(f"Raw Response: {response.text}") # Uncomment for debugging
             return {}
 
     def analyze_vision_fraud(self, file_bytes: bytes) -> dict:
@@ -306,9 +307,7 @@ async def upload_file(file: UploadFile = File(...)):
         safe_text = PIISanitizer().sanitize(raw_text)
         ai_data = analyzer.analyze_initial(safe_text)
 
-        if not ai_data:
-            ai_data = {}
-
+        # ✅ SAFE RETURN: Uses .get() with defaults to prevent NoneType crashes
         return {
             "origin_country": ai_data.get("origin_country", "Unknown"),
             "currency_symbol": ai_data.get("currency_symbol", "$"),
@@ -317,7 +316,7 @@ async def upload_file(file: UploadFile = File(...)):
             "risk_flags": int(ai_data.get("risk_flags") or 0),
             "creditScore": int(ai_data.get("creditScore") or 0),
             "riskProfile": ai_data.get("riskProfile", "Unknown"),
-            "fraudScore": int(fraud_score or 0),
+            "fraudScore": int(fraud_score),
             "cashFlow": ai_data.get("cashFlow", []),
             "predictiveFlow": ai_data.get("predictiveFlow", []),
             "transactions": ai_data.get("transactions", [])
