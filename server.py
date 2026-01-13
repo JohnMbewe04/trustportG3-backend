@@ -4,6 +4,7 @@ import json
 import re
 import typing
 import logging
+import time  # <--- Added for waiting
 
 import numpy as np
 import pdfplumber
@@ -147,7 +148,8 @@ def resize_image_for_api(image_bytes: bytes) -> PIL.Image.Image:
     img = PIL.Image.open(io.BytesIO(image_bytes))
     if img.mode != 'RGB':
         img = img.convert('RGB')
-    img.thumbnail((1024, 1024))
+    # Resize to 800x800 to save tokens (Vision costs depend on resolution)
+    img.thumbnail((800, 800))
     return img
 
 def extract_pdf(file_bytes: bytes) -> str:
@@ -160,21 +162,14 @@ def extract_pdf(file_bytes: bytes) -> str:
         return ""
 
 # ---------------------------------------------------------------------------
-# GEMINI ANALYZER
+# GEMINI ANALYZER (WITH RETRY LOGIC)
 # ---------------------------------------------------------------------------
 class GeminiAnalyzer:
     def __init__(self):
-        # PRIORITY LIST: Try Gemini 3 (2026), then 2.0 (Stable Bridge), then 1.5 (Legacy)
-        self.model_name = self._get_working_model([
-            "gemini-3-flash-preview", 
-            "gemini-2.0-flash", 
-            "gemini-1.5-flash",
-            "gemini-1.5-flash-latest"
-        ])
-        
+        # Using 2.0 Flash as confirmed working
+        self.model_name = "gemini-2.0-flash"
         self.model = genai.GenerativeModel(self.model_name)
-        logger.info(f"🚀 Using Model: {self.model_name}")
-
+        
         self.safety_settings = [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
             {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
@@ -182,33 +177,38 @@ class GeminiAnalyzer:
             {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
         ]
 
-    def _get_working_model(self, candidates):
-        """Finds the first model that doesn't 404 for this API Key."""
-        # For efficiency, we just hardcode the selection logic or environment
-        # But here we default to the most likely stable one if 3.0 fails
-        # In a real deployment, we might ping `list_models` but that is slow.
-        # We will default to a 'smart' fallback logic.
-        
-        # If the environment is clearly "Simulated 2026", 3-flash should work.
-        # If 1.5 failed, we try 2.0.
-        return "gemini-2.0-flash" # The safest 'bridge' model for both timelines.
+    def _call_with_retry(self, content):
+        """Tries to call Gemini, waits if Rate Limited (429)"""
+        max_retries = 3
+        delay = 10  # Seconds to wait before first retry
 
-    def _json_call(self, content):
-        try:
-            response = self.model.generate_content(
-                content,
-                generation_config={"response_mime_type": "application/json"},
-                safety_settings=self.safety_settings
-            )
-            return extract_json(response.text)
-        except Exception as e:
-            logger.error(f"Gemini JSON Error ({self.model_name}): {e}")
-            return {}
+        for attempt in range(max_retries):
+            try:
+                response = self.model.generate_content(
+                    content,
+                    generation_config={"response_mime_type": "application/json"},
+                    safety_settings=self.safety_settings
+                )
+                return extract_json(response.text)
+            
+            except Exception as e:
+                error_str = str(e).lower()
+                # Check for Rate Limit (429) or Quota errors
+                if "429" in error_str or "quota" in error_str:
+                    logger.warning(f"⚠️ Quota Exceeded. Waiting {delay}s before retry {attempt+1}/{max_retries}...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff (10s -> 20s -> 40s)
+                else:
+                    # If it's another error (like 500 or safety), stop trying
+                    logger.error(f"Gemini Error (Non-Retryable): {e}")
+                    return {}
+        
+        return {} # Failed after all retries
 
     def analyze_vision_fraud(self, file_bytes: bytes) -> dict:
         try:
             image = resize_image_for_api(file_bytes)
-            return self._json_call([VISION_FRAUD_PROMPT, image])
+            return self._call_with_retry([VISION_FRAUD_PROMPT, image])
         except Exception as e:
             logger.error(f"Vision Error: {e}")
             return {"text": "", "fraud_score": 0}
@@ -216,15 +216,16 @@ class GeminiAnalyzer:
     def analyze_initial(self, text: str) -> dict:
         if not text or len(text) < 10:
             return {}
-        prompt = BASEL_ANALYSIS_PROMPT.format(text=text[:30000])
-        return self._json_call(prompt)
+        # Truncate text to 20k chars to save tokens
+        prompt = BASEL_ANALYSIS_PROMPT.format(text=text[:20000])
+        return self._call_with_retry(prompt)
 
     def convert_context(self, current_data: dict, target_country: str) -> dict:
         prompt = CONVERSION_PROMPT.format(
             target_country=target_country,
             profile=json.dumps(current_data)
         )
-        return self._json_call(prompt)
+        return self._call_with_retry(prompt)
 
     def generate_chat_response(self, context: dict, history: list, mode: str) -> dict:
         system_instruction = "You are a helpful banking assistant."
@@ -236,7 +237,7 @@ class GeminiAnalyzer:
             history=json.dumps(history[-4:]),
             user_message=history[-1]["content"] if history else ""
         )
-        res = self._json_call(prompt)
+        res = self._call_with_retry(prompt)
         if not res: return {"reply": "I'm processing...", "visual_cue": "none"}
         return res
 
@@ -276,8 +277,7 @@ class ChatRequest(BaseModel):
 # ---------------------------------------------------------------------------
 @app.get("/api/health")
 def health_check():
-    """Simple health check to see if server is up"""
-    return {"status": "ok", "version": "Gemini 3 Backend"}
+    return {"status": "ok", "version": "Gemini 3 Backend (Retry Enabled)"}
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -305,7 +305,7 @@ async def upload_file(file: UploadFile = File(...)):
         ai_data = analyzer.analyze_initial(safe_text)
         
         if not ai_data:
-             return {"error": True, "message": "AI analysis failed. Try a different document."}
+             return {"error": True, "message": "AI analysis failed (Quota or Content). Try again in 1 min."}
 
         return {
             "origin_country": ai_data.get("origin_country", "Unknown"),
@@ -352,6 +352,5 @@ def chat(req: ChatRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    # PORT 8000 is for local, Render usually sets PORT env var
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
