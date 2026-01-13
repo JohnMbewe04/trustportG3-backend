@@ -195,9 +195,21 @@ class GeminiAnalyzer:
                     temperature=0.2
                 )
             )
-            return json.loads(response.text)
+
+            texr = response.text.strip()
+
+            if text.startswith("'''json"):
+                text = text[7:]
+            if text.startswith("'''"):
+                text = text[3:]
+            if text.endswith("'''"):
+                text = text[:-3]
+            
+            return json.loads(text.strip())
+            
         except Exception as e:
             print(f"Gemini JSON Error: {e}")
+            print(f"Raw Response was: {response.text if 'response' in locals() else 'None'}")
             return {}
 
     def analyze_vision_fraud(self, file_bytes: bytes) -> dict:
@@ -294,15 +306,18 @@ async def upload_file(file: UploadFile = File(...)):
         safe_text = PIISanitizer().sanitize(raw_text)
         ai_data = analyzer.analyze_initial(safe_text)
 
+        if not ai_data:
+            ai_data = {}
+
         return {
             "origin_country": ai_data.get("origin_country", "Unknown"),
             "currency_symbol": ai_data.get("currency_symbol", "$"),
-            "monthly_income": float(ai_data.get("monthly_income", 0)),
-            "savings_rate": float(ai_data.get("savings_rate", 0)),
-            "risk_flags": int(ai_data.get("risk_flags", 0)),
-            "creditScore": int(ai_data.get("creditScore", 0)),
+            "monthly_income": float(ai_data.get("monthly_income") or 0),
+            "savings_rate": float(ai_data.get("savings_rate") or 0),
+            "risk_flags": int(ai_data.get("risk_flags") or 0),
+            "creditScore": int(ai_data.get("creditScore") or 0),
             "riskProfile": ai_data.get("riskProfile", "Unknown"),
-            "fraudScore": fraud_score,
+            "fraudScore": int(fraud_score or 0),
             "cashFlow": ai_data.get("cashFlow", []),
             "predictiveFlow": ai_data.get("predictiveFlow", []),
             "transactions": ai_data.get("transactions", [])
